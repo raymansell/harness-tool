@@ -5,7 +5,7 @@ import { DBOS } from '@dbos-inc/dbos-sdk';
 import express from 'express';
 import { createServer } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { ensureSchema } from '../harness/db';
+import { ensureSchema, clearEventLog } from '../harness/db';
 import { subscribe, history } from '../harness/bus';
 import { runAgentWorkflow } from '../harness/runtime';
 import type { ClientMessage } from '@shared/events';
@@ -26,7 +26,14 @@ async function main() {
   await DBOS.launch();
 
   const app = express();
+
   app.get('/health', (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  // Clear the durable log. The inspector calls this, then reloads.
+  app.post('/api/clear', async (_req, res) => {
+    await clearEventLog();
     res.json({ ok: true });
   });
 
