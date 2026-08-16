@@ -5,10 +5,16 @@ import { EventType } from '@shared/events';
 import { emit } from './bus';
 import { model } from './model';
 import { tools, runTool } from './tools';
-import { SYSTEM_PROMPT } from './system-prompt';
+import {
+  buildContext,
+  summarize,
+  estimateTokens,
+  MAX_CONTEXT_TOKENS,
+  KEEP_CONTEXT_TOKENS,
+} from './memory';
 
 // A safety cap so a confused model can't loop forever.
-const MAX_STEPS = 10;
+const MAX_STEPS = 30;
 
 type ToolCall = {
   toolCallId: string;
@@ -27,14 +33,13 @@ type Turn = {
   responseMessages: ModelMessage[];
 };
 
-// One model turn: stream the tokens out as events, then return the assistant's
-// message(s) and any tool calls. We run this as a DBOS step, so a completed turn
-// is checkpointed and never re-called — a crash won't re-bill the LLM.
+// One model turn over the HYDRATED context (not the whole history). Run as a
+// DBOS step so a completed turn is checkpointed and never re-billed.
 async function modelTurn(
   workflowId: string,
-  messages: ModelMessage[],
+  context: ModelMessage[],
 ): Promise<Turn> {
-  const result = streamText({ model, messages, tools });
+  const result = streamText({ model, messages: context, tools });
 
   for await (const part of result.fullStream) {
     if (part.type === 'text-delta') {
@@ -66,11 +71,7 @@ async function toolStep(
     workflowId,
     toolCallId: call.toolCallId,
     name: call.toolName,
-    args: call.input, // This helps us know the args the LLM wants to
-    // use for the tool call. Useful for scenarios like: "do you
-    // approve the bank transfer?" but we need to know the transaction
-    // details in order to approve. The transaction details would
-    // be the args here.
+    args: call.input,
   });
   const output = await runTool(call.toolName, call.input);
   await emit({
@@ -82,60 +83,75 @@ async function toolStep(
   return output;
 }
 
-// THE DURABLE AGENT LOOP.
+// THE DURABLE AGENT LOOP, now with bounded memory.
 //
-// Structurally it's the same while-loop as before — but every model call and
-// every tool call is a DBOS step. DBOS checkpoints each step's result to
-// Postgres. If the process crashes mid-run, DBOS recovers this workflow on the
-// next launch and resumes from the last completed step: no repeated LLM calls,
-// no duplicate sends, no lost work.
+// We keep the conversation as a list of TURNS. Each pass:
+//   1. if we have too many turns, compact the oldest into a running summary
+//   2. hydrate the context (system + task + summary + recent turns)
+//   3. run one model turn over THAT context — not the whole history
+
 //
-// The catch: the workflow body itself re-runs on recovery, so it must be
-// deterministic. All non-determinism (the model, the tools, the clock) lives
-// inside steps — the body just orchestrates and rebuilds `messages` from the
-// cached step results.
+// So the tokens we send stay roughly flat no matter how long the task runs. The
+// full history still lives, durably, in the Postgres event log.
 async function agentWorkflow(input: string): Promise<string> {
-  // The `input` parameter of this function is persisted to the database on
-  // each new workflow execution
-  // https://docs.dbos.dev/architecture#how-workflow-recovery-works
   const workflowId = DBOS.workflowID ?? 'unknown';
 
-  // DBOS steps persist the inputs and outputs of WORKFLOWS in a database.
-  // This makes operations durable, allowing them to survive server failures,
-  // be retried if needed, and prevents duplicate executions. Each step's state
-  // is tracked in the database, enabling recovery from where execution left off.
-  // Database emit operations (like the one below and any time we call emit()
-  // from bus.ts) should be in steps to make them persistent and idempotent.
-  // Without being in a step,these operations are just floating in the workflow
-  // and are not idempotent,meaning they could run more than once and produce
-  // different results each time the workflow restarts.
   await DBOS.runStep(
     () => emit({ type: EventType.WorkflowStarted, workflowId, input }),
     { name: 'started' },
   );
 
-  // This is deterministic so it can stay inside the workflow, it never changes
-  const messages: ModelMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: input }, // If this is a recovery run, then the (old) `input`
-    // param was retrieved from the database during `await DBOS.launch();`
-    //  (see workflow_status and workflow_inputs tables in the dbos schema)
-    // https://docs.dbos.dev/architecture#how-workflow-recovery-works
-  ];
+  const turns: ModelMessage[][] = [];
+  let summary = '';
 
   let step = 0;
   while (step < MAX_STEPS) {
-    // Wrapping an LLM call inside a step prevents it from rerunning every time
-    // the workflow restarts. This avoids unnecessary LLM costs by ensuring that if the
-    // LLM already ran on the current turn, it won't run again if the workflow stops and resumes.
-    // Note that awaiting a step doesn't stop the streaming behavior. The stream continues
-    // to work inside the step function. The await is waiting for the step to run and complete,
-    // not for the result itself, so all the streaming operations within the step continue
-    // to execute normally.
-    const turn = await DBOS.runStep(() => modelTurn(workflowId, messages), {
+    // 1. Compact: while the recent window is over budget, peel the oldest turns
+    //    into the running summary (keeping at least the last turn verbatim).
+    //    We compact before a model turn because we need to ensure the token limit
+    //    before the actual model turn (LLM inference call) runs (where it can
+    //    potentially go over budged and break mid-turn)
+    if (estimateTokens(turns.flat()) > MAX_CONTEXT_TOKENS) {
+      const old: ModelMessage[][] = [];
+      while (
+        turns.length > 1 &&
+        estimateTokens(turns.flat()) > KEEP_CONTEXT_TOKENS
+      ) {
+        const oldest = turns.shift(); // sliding window
+        if (oldest) {
+          old.push(oldest);
+        }
+      }
+      if (old.length > 0) {
+        summary = await DBOS.runStep(() => summarize(old, summary), {
+          name: `summarize-${step}`,
+        });
+        const contextTokens = estimateTokens(
+          buildContext(input, summary, turns),
+        );
+        await DBOS.runStep(
+          () =>
+            emit({
+              type: EventType.MemoryCompacted,
+              workflowId,
+              summarizedTurns: old.length,
+              contextTokens,
+              summary,
+            }),
+          { name: `compacted-${step}` },
+        );
+      }
+    }
+
+    // 2 + 3. Hydrate the context and run one turn over it.
+    // each model call goes over the hydrated context instead of the full history
+    // and modelTurn takes that context instead of the whole messages array
+    const context = buildContext(input, summary, turns);
+
+    const turn = await DBOS.runStep(() => modelTurn(workflowId, context), {
       name: `model-${step}`,
     });
-    messages.push(...turn.responseMessages);
+    const turnMessages: ModelMessage[] = [...turn.responseMessages];
 
     if (turn.toolCalls.length === 0) {
       await DBOS.runStep(
@@ -161,7 +177,7 @@ async function agentWorkflow(input: string): Promise<string> {
       });
 
       // Feed the tool result back to the model on the next turn.
-      messages.push({
+      turnMessages.push({
         role: 'tool',
         content: [
           {
@@ -174,6 +190,7 @@ async function agentWorkflow(input: string): Promise<string> {
       });
     }
 
+    turns.push(turnMessages);
     step++;
   }
 
