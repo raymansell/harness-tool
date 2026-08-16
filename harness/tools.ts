@@ -102,6 +102,25 @@ export const tools = {
       draftId: z.string(),
     }),
   }),
+
+  // Privileged: only the billing specialist gets this. Moves real money.
+  issueRefund: tool({
+    description:
+      'Issue a refund to the customer. IRREVERSIBLE — this moves real money.',
+    inputSchema: z.object({
+      customerId: z.string(),
+      chargeId: z.string(),
+      amountCents: z.number(),
+    }),
+  }),
+
+  // Hand the conversation to a specialist agent. The harness intercepts this —
+  // it switches the running agent rather than executing a tool via `runTool`.
+  handoff: tool({
+    description:
+      "Hand off the conversation to a specialist agent when the task needs a capability you don't have (e.g. issuing a refund → billing).",
+    inputSchema: z.object({ to: z.enum(['billing']), reason: z.string() }),
+  }),
 };
 
 // The harness-owned executor.
@@ -125,6 +144,14 @@ export async function runTool(
     case 'sendReply':
       // DANGEROUS: an irreversible side effect with zero confirmation.
       return { sent: true, itemId: args.itemId, draftId: args.draftId };
+    case 'issueRefund':
+      // DANGEROUS: an irreversible side effect with zero confirmation.
+      return {
+        refunded: true,
+        customerId: args.customerId,
+        chargeId: args.chargeId,
+        amountCents: args.amountCents,
+      };
     default:
       throw new Error(`unknown tool: ${name}`);
   }

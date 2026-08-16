@@ -1,7 +1,6 @@
 import { generateText } from 'ai';
 import type { ModelMessage } from 'ai';
 import { model } from './model';
-import { SYSTEM_PROMPT } from './system-prompt';
 
 // Compact once the recent-turns window grows past MAX_CONTEXT_TOKENS, peeling
 // the oldest turns into the summary until it's back under KEEP_CONTEXT_TOKENS.
@@ -30,20 +29,22 @@ export function estimateTokens(messages: ModelMessage[]): number {
 //   · STATE    = a running SUMMARY of older turns (compacted working memory).
 //   · CONTEXT  = what the model actually sees THIS turn, assembled on demand.
 //
-// buildContext hydrates the context: the system prompt, the pinned task, the
-// summary of old work, and only the most recent turns verbatim.
+// buildContext hydrates the context for the current driving agent, it includes
+// the system prompt, the pinned task, the summary of old work, and only the
+// most recent turns verbatim.
 export function buildContext(
+  systemPrompt: string,
   task: string,
   summary: string,
   turns: ModelMessage[][],
 ): ModelMessage[] {
   const context: ModelMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemPrompt },
     // the objective (task) is pinned, never summarized away
     { role: 'user', content: task },
   ];
   if (summary) {
-    context[0].content += `Summary of earlier work so far:\n${summary}`;
+    context[0].content += `\nSummary of earlier work so far:\n${summary}`;
   }
   for (const turn of turns) {
     context.push(...turn);

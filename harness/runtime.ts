@@ -1,10 +1,11 @@
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { streamText } from 'ai';
-import type { ModelMessage, JSONValue } from 'ai';
+import type { ModelMessage, JSONValue, ToolSet } from 'ai';
 import { EventType } from '@shared/events';
 import { emit } from './bus';
 import { model } from './model';
-import { tools, runTool } from './tools';
+import { runTool } from './tools';
+import { triageAgent, agents } from './agents';
 import {
   buildContext,
   summarize,
@@ -38,8 +39,9 @@ type Turn = {
 async function modelTurn(
   workflowId: string,
   context: ModelMessage[],
+  agentTools: ToolSet,
 ): Promise<Turn> {
-  const result = streamText({ model, messages: context, tools });
+  const result = streamText({ model, messages: context, tools: agentTools });
 
   for await (const part of result.fullStream) {
     if (part.type === 'text-delta') {
@@ -83,16 +85,39 @@ async function toolStep(
   return output;
 }
 
-// THE DURABLE AGENT LOOP, now with bounded memory.
+// Helper used to manually respond to tool calls that don't have automatic
+// formatting (such as `handoff`).
+function toolResultMessage(call: ToolCall, value: JSONValue): ModelMessage {
+  return {
+    role: 'tool',
+    content: [
+      {
+        type: 'tool-result',
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        output: { type: 'json', value },
+      },
+    ],
+  };
+}
+
+// THE DURABLE AGENT LOOP, a general runtime that runs any agent.
 //
 // We keep the conversation as a list of TURNS. Each pass:
 //   1. if we have too many turns, compact the oldest into a running summary
 //   2. hydrate the context (system + task + summary + recent turns)
 //   3. run one model turn over THAT context — not the whole history
-
 //
 // So the tokens we send stay roughly flat no matter how long the task runs. The
 // full history still lives, durably, in the Postgres event log.
+//
+// Supports handoffs.
+//   · it runs the CURRENT agent's prompt + tools (starts with the triage agent)
+//   · the `handoff` tool isn't executed — the harness intercepts it and SWITCHES
+//     the running agent, keeping the conversation. Control transfers laterally.
+//
+// `currentAgent` is rebuilt deterministically on recovery (the handoff is a
+// consequence of a cached model decision), so this composes with durability.
 async function agentWorkflow(input: string): Promise<string> {
   const workflowId = DBOS.workflowID ?? 'unknown';
 
@@ -100,6 +125,9 @@ async function agentWorkflow(input: string): Promise<string> {
     () => emit({ type: EventType.WorkflowStarted, workflowId, input }),
     { name: 'started' },
   );
+
+  let currentAgent = triageAgent; // point of entry agent, this is the default
+  // everytime a new workflow starts
 
   const turns: ModelMessage[][] = [];
   let summary = '';
@@ -127,7 +155,7 @@ async function agentWorkflow(input: string): Promise<string> {
           name: `summarize-${step}`,
         });
         const contextTokens = estimateTokens(
-          buildContext(input, summary, turns),
+          buildContext(currentAgent.systemPrompt, input, summary, turns),
         );
         await DBOS.runStep(
           () =>
@@ -146,11 +174,19 @@ async function agentWorkflow(input: string): Promise<string> {
     // 2 + 3. Hydrate the context and run one turn over it.
     // each model call goes over the hydrated context instead of the full history
     // and modelTurn takes that context instead of the whole messages array
-    const context = buildContext(input, summary, turns);
+    const context = buildContext(
+      currentAgent.systemPrompt,
+      input,
+      summary,
+      turns,
+    );
 
-    const turn = await DBOS.runStep(() => modelTurn(workflowId, context), {
-      name: `model-${step}`,
-    });
+    const turn = await DBOS.runStep(
+      () => modelTurn(workflowId, context, currentAgent.tools),
+      {
+        name: `model-${step}`,
+      },
+    );
     const turnMessages: ModelMessage[] = [...turn.responseMessages];
 
     if (turn.toolCalls.length === 0) {
@@ -172,22 +208,40 @@ async function agentWorkflow(input: string): Promise<string> {
     }
 
     for (const call of turn.toolCalls) {
-      const output = await DBOS.runStep(() => toolStep(workflowId, call), {
-        name: `tool-${call.toolCallId}`,
-      });
-
-      // Feed the tool result back to the model on the next turn.
-      turnMessages.push({
-        role: 'tool',
-        content: [
-          {
-            type: 'tool-result',
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            output: { type: 'json', value: output as JSONValue },
-          },
-        ],
-      });
+      if (call.toolName === 'handoff') {
+        // The harness intercepts handoff: switch the running agent, don't run
+        // a tool execution. This is done at the runtime level rather than at
+        // the main agent tool to clearly separate the main agent out of its
+        // own context, and start a fresh conversation in a separate agent.
+        // Otherwise the result of the handoff tool execution would go back to
+        // the main agent into its own context and the main agent would remain involved.
+        const to = String(call.input.to ?? '');
+        const reason = String(call.input.reason ?? '');
+        const from = currentAgent.name;
+        await DBOS.runStep(
+          () =>
+            emit({
+              type: EventType.AgentHandoff,
+              workflowId,
+              from,
+              to,
+              reason,
+            }),
+          { name: `handoff-${call.toolCallId}` },
+        );
+        currentAgent = agents[to] ?? currentAgent;
+        turnMessages.push(
+          toolResultMessage(call, {
+            ok: true,
+            message: `You are now the ${to} specialist. Take over and FINISH the task by calling the tools you need — do the work, don't just acknowledge the handoff.`,
+          }),
+        );
+      } else {
+        const output = await DBOS.runStep(() => toolStep(workflowId, call), {
+          name: `tool-${call.toolCallId}`,
+        });
+        turnMessages.push(toolResultMessage(call, output as JSONValue));
+      }
     }
 
     turns.push(turnMessages);
