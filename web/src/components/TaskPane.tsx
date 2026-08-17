@@ -224,6 +224,9 @@ export function TaskPane({
   const [input, setInput] = useState('');
   const [supervised, setSupervised] = useState(false);
   const { turns, running } = toTranscript(events);
+  const lastTurn = turns[turns.length - 1];
+  const showLoader =
+    running && !(lastTurn?.role === 'approval' && lastTurn.state === 'pending');
 
   function submit() {
     const text = input.trim();
@@ -267,7 +270,7 @@ export function TaskPane({
           {turns.map((turn) => (
             <TurnView key={turn.id} turn={turn} />
           ))}
-          {running && (
+          {showLoader && (
             <div className='px-1'>
               <TextDotsLoader />
             </div>

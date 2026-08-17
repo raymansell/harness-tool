@@ -28,6 +28,8 @@ async function main() {
 
   const app = express();
 
+  app.use(express.json());
+
   app.get('/health', (_req, res) => {
     res.json({ ok: true });
   });
@@ -35,6 +37,15 @@ async function main() {
   // Clear the durable log. The inspector calls this, then reloads.
   app.post('/api/clear', async (_req, res) => {
     await clearEventLog();
+    res.json({ ok: true });
+  });
+
+  // Human-in-the-loop: deliver an approval decision to a suspended workflow.
+  // DBOS.send wakes its recv() by writting the message to Postgres
+  // even days later, even after a restart.
+  app.post('/api/approve/:workflowId', async (req, res) => {
+    const approved = Boolean(req.body?.approved);
+    await DBOS.send(req.params.workflowId, { approved }, 'approval');
     res.json({ ok: true });
   });
 

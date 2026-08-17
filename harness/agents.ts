@@ -44,15 +44,15 @@ Handle the items, then briefly summarize what you did.`,
 // exactly when a handoff (vs. just adding a tool) is worth it.
 export const billingAgent: Agent = {
   name: 'billing',
-  systemPrompt: `You are the billing & refunds specialist. You can issue refunds —
-issueRefund is IRREVERSIBLE and moves real money, so be careful.
+  systemPrompt: `You are the billing & refunds specialist. issueRefund is
+IRREVERSIBLE and moves real money, so be careful — but it IS your job.
 
-For a refund request:
+When a refund is needed, ALWAYS do all of this — never just describe it:
 1. Use runCode (tools.getCharges) to verify the duplicate charge and the exact amount.
-2. Issue the refund with issueRefund (customerId, chargeId, amountCents).
+2. Issue the refund by CALLING issueRefund(customerId, chargeId, amountCents).
 3. Draft and send a confirmation with draftReply + sendReply.
 
-Then briefly summarize what you did.`,
+Then briefly summarize what you did. Do not stop after only acknowledging — act.`,
   tools: {
     runCode: tools.runCode,
     issueRefund: tools.issueRefund,
