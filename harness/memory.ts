@@ -7,8 +7,8 @@ import { model } from './model';
 // Token budget — not turn count — is what actually drives context bloat, and it
 // holds up even when the model batches many tool calls into one turn.
 // (Rough estimate: ~4 chars per token. Kept low so compaction kicks in on a short task.)
-export const MAX_CONTEXT_TOKENS = 500;
-export const KEEP_CONTEXT_TOKENS = 200;
+export const MAX_CONTEXT_TOKENS = 3000;
+export const KEEP_CONTEXT_TOKENS = 1500;
 
 // Don't use this in production, for accurate token counting use a tokeniser based off
 // of the same encoder that the model uses (such as tiktoken for openai models)

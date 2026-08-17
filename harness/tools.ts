@@ -6,7 +6,7 @@ import { runInSandbox, type SandboxApi } from './sandbox';
 type Charge = { id: string; amount: number; date: string; description: string };
 
 // Note the planted duplicate: ch_001 and ch_002 are the same charge.
-const CHARGES: Record<string, Charge[]> = {
+export const CHARGES: Record<string, Charge[]> = {
   cus_88121: [
     {
       id: 'ch_001',
@@ -39,7 +39,7 @@ const KNOWLEDGE_BASE: Record<string, string> = {
     'Team plans are $20/seat/mo with a volume discount at 25+ seats. For 50+ seats, send the pricing PDF.',
 };
 
-function searchKB(query: string): string[] {
+export function searchKB(query: string): string[] {
   const q = query.toLowerCase();
   const hits = Object.entries(KNOWLEDGE_BASE)
     .filter(([key]) => q.includes(key))
