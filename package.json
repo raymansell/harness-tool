@@ -18,6 +18,7 @@
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite",
     "build": "vite build",
+    "start": "tsx server/index.ts",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },

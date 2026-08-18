@@ -1,6 +1,9 @@
 // MUST be first: loads .env.vars before any module that reads env at load time.
 import './env';
 
+import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import express from 'express';
 import { createServer } from 'node:http';
@@ -47,6 +50,19 @@ async function main() {
     const approved = Boolean(req.body?.approved);
     await DBOS.send(req.params.workflowId, { approved }, 'approval');
     res.json({ ok: true });
+  });
+
+  // Serve the built inspector (web/dist) from this same origin, so the backend
+  // is the only exposed port. `npm run build` produces it at image time; in
+  // local dev the inspector is served by vite on :5173 instead.
+  const distDir = fileURLToPath(new URL('../web/dist', import.meta.url));
+  const indexPath = path.join(distDir, 'index.html');
+  app.use(express.static(distDir));
+  app.use((req, res, next) => {
+    if (req.method !== 'GET') return next();
+    if (req.path.startsWith('/api') || req.path === '/health') return next();
+    if (existsSync(indexPath)) return res.sendFile(indexPath);
+    next();
   });
 
   const server = createServer(app);

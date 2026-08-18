@@ -4,5 +4,12 @@ dist
 .env.*
 !.env.vars.example
 *.log
+.terraform/
+terraform.tfstate.d/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+*.auto.tfvars
+terraform.tfvars
 .DS_Store
 
